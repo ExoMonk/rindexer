@@ -517,7 +517,8 @@ async fn live_indexing_for_contract_event_dependencies(
                     // clone here over the full logs way less overhead
                     let last_log = logs.last().cloned();
 
-                    let fetched_logs = Ok(FetchLogsResult { logs, from_block, to_block });
+                    let fetched_logs =
+                        Ok(FetchLogsResult { logs, from_block, to_block, reorg: None });
 
                     let result = handle_logs_result(
                         Arc::clone(config),
