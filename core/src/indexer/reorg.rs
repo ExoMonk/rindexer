@@ -1,4 +1,4 @@
-use alloy::primitives::{B256, U64};
+use alloy::primitives::U64;
 use lru::LruCache;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};

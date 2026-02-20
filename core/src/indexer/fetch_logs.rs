@@ -25,6 +25,8 @@ use tracing::{debug, error, info, warn};
 /// Metadata for a processed block, used for reorg detection via parent hash chain validation.
 pub struct BlockMeta {
     pub hash: B256,
+    /// Stored for diagnostic logging; validation reads parent_hash from the new block header.
+    #[allow(dead_code)]
     pub parent_hash: B256,
     pub timestamp: u64,
 }

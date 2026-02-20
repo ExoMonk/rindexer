@@ -2,6 +2,8 @@ use alloy::primitives::{B256, U64};
 
 use futures::future::join_all;
 use futures::StreamExt;
+use lru::LruCache;
+use std::num::NonZeroUsize;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
 use tokio::{
@@ -9,10 +11,10 @@ use tokio::{
     task::{JoinError, JoinHandle},
     time::Instant,
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::helpers::is_relevant_block;
-use crate::indexer::reorg::reorg_safe_distance_for_chain;
+use crate::indexer::reorg::{find_fork_point, handle_reorg_recovery, reorg_safe_distance_for_chain};
 use crate::metrics::indexing as metrics;
 use crate::provider::JsonRpcCachedProvider;
 use crate::{
@@ -22,7 +24,7 @@ use crate::{
     },
     indexer::{
         dependency::{ContractEventsDependenciesConfig, EventDependencies},
-        fetch_logs::{fetch_logs_stream, FetchLogsResult},
+        fetch_logs::{fetch_logs_stream, BlockMeta, FetchLogsResult, ReorgInfo},
         last_synced::update_progress_and_last_synced_task,
         progress::IndexingEventProgressStatus,
         task_tracker::{indexing_event_processed, indexing_event_processing},
@@ -330,6 +332,10 @@ async fn live_indexing_for_contract_event_dependencies(
     // Use the first event's cancel_token -- all events in this generation share the same token.
     let generation_cancel = events.first().map(|(config, _)| config.cancel_token().clone());
 
+    // Block metadata cache for reorg detection via parent hash chain validation.
+    let mut block_cache: LruCache<u64, BlockMeta> =
+        LruCache::new(NonZeroUsize::new(256).unwrap());
+
     loop {
         if !is_running() {
             break;
@@ -363,6 +369,55 @@ async fn live_indexing_for_contract_event_dependencies(
             }
         };
         let latest_block_number = U64::from(latest_block.header.number);
+
+        // Reorg detection: store block metadata and validate parent hash chain
+        block_cache.put(
+            latest_block.header.number,
+            BlockMeta {
+                hash: latest_block.header.hash,
+                parent_hash: latest_block.header.parent_hash,
+                timestamp: latest_block.header.timestamp,
+            },
+        );
+
+        let parent_mismatch = if latest_block.header.number > 0 {
+            block_cache
+                .peek(&(latest_block.header.number - 1))
+                .map(|cached| cached.hash != latest_block.header.parent_hash)
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        if parent_mismatch {
+            let fork_block =
+                find_fork_point(&block_cache, &cached_provider, latest_block.header.number).await;
+            let depth = latest_block.header.number.saturating_sub(fork_block);
+            metrics::record_reorg(&network, depth);
+            warn!(
+                "Dependency indexer on {} - REORG DETECTED: depth={}, fork_block={}",
+                network, depth, fork_block
+            );
+
+            // Invalidate cached hashes for reorged blocks
+            for b in fork_block..=latest_block.header.number {
+                block_cache.pop(&b);
+            }
+
+            // Recovery: delete reorged events and rewind checkpoints for all events
+            let reorg_info = ReorgInfo { fork_block: U64::from(fork_block), depth };
+            for (config, _) in events.iter() {
+                handle_reorg_recovery(config, &reorg_info).await;
+                let mut details = ordering_live_indexing_details_map
+                    .get(&config.id())
+                    .expect("ordering_live_indexing_details_map")
+                    .lock()
+                    .await;
+                details.filter = details.filter.clone().set_from_block(U64::from(fork_block));
+                details.last_seen_block_number = U64::from(fork_block.saturating_sub(1));
+            }
+            continue;
+        }
 
         for (config, _) in events.iter() {
             let mut ordering_live_indexing_details = ordering_live_indexing_details_map
@@ -513,6 +568,44 @@ async fn live_indexing_for_contract_event_dependencies(
                         to_block
                     );
 
+                    // Reorg detection: check for removed logs from RPC
+                    if logs.iter().any(|log| log.removed) {
+                        let min_removed_block = logs
+                            .iter()
+                            .filter(|l| l.removed)
+                            .filter_map(|l| l.block_number)
+                            .min()
+                            .unwrap_or(from_block.to::<u64>());
+                        let depth =
+                            from_block.to::<u64>().saturating_sub(min_removed_block);
+                        metrics::record_reorg(&network, depth);
+                        warn!(
+                            "{} - REORG (removed logs): fork_block={}, depth={}",
+                            config.info_log_name(),
+                            min_removed_block,
+                            depth
+                        );
+
+                        let reorg_info = ReorgInfo {
+                            fork_block: U64::from(min_removed_block),
+                            depth,
+                        };
+                        handle_reorg_recovery(config, &reorg_info).await;
+
+                        // Rewind cursor for this event
+                        ordering_live_indexing_details.filter = ordering_live_indexing_details
+                            .filter
+                            .set_from_block(U64::from(min_removed_block));
+                        ordering_live_indexing_details.last_seen_block_number =
+                            U64::from(min_removed_block.saturating_sub(1));
+                        *ordering_live_indexing_details_map
+                            .get(&config.id())
+                            .expect("ordering_live_indexing_details_map")
+                            .lock()
+                            .await = ordering_live_indexing_details;
+                        continue;
+                    }
+
                     let logs_empty = logs.is_empty();
                     // clone here over the full logs way less overhead
                     let last_log = logs.last().cloned();
@@ -646,6 +739,12 @@ async fn handle_logs_result(
 ) -> Result<JoinHandle<()>, Box<dyn std::error::Error + Send>> {
     match result {
         Ok(result) => {
+            // Handle reorg recovery before processing logs
+            if let Some(reorg) = &result.reorg {
+                handle_reorg_recovery(&config, reorg).await;
+                return Ok(tokio::spawn(async {}));
+            }
+
             debug!("{} - Processing {} logs", config.info_log_name(), result.logs.len());
 
             let fn_data = result
