@@ -25,13 +25,11 @@ use tracing::{debug, error, info, warn};
 /// Metadata for a processed block, used for reorg detection via parent hash chain validation.
 pub struct BlockMeta {
     pub hash: B256,
-    /// Stored for diagnostic logging; validation reads parent_hash from the new block header.
     #[allow(dead_code)]
     pub parent_hash: B256,
     pub timestamp: u64,
 }
 
-/// Information about a detected chain reorganization.
 pub struct ReorgInfo {
     /// First block number that diverged from the canonical chain.
     pub fork_block: U64,
@@ -445,8 +443,8 @@ async fn live_indexing_stream(
 
     // Local cache of recent block metadata (hash, parent_hash, timestamp).
     // Used for: (1) cheap timestamp lookups for logs, (2) reorg detection via parent hash
-    // chain validation. 1024 entries covers ~34 min of Polygon blocks (one Heimdall
-    // checkpoint period) at ~100KB memory cost.
+    // chain validation. 1024 entries at ~100KB memory cost and would cover worst case scenariots
+    // for rollups having long-mechanisms like Polygon 1 epoch.
     let mut block_cache: LruCache<u64, BlockMeta> = LruCache::new(NonZeroUsize::new(1024).unwrap());
 
     loop {

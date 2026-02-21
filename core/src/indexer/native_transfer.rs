@@ -112,6 +112,7 @@ async fn push_range(block_tx: &mpsc::Sender<U64>, last: U64, latest: U64) {
 ///
 /// This process respects channel backpressure and will only complete once the `end_block` is
 /// reached.
+#[allow(clippy::too_many_arguments)]
 pub async fn native_transfer_block_fetch(
     publisher: Arc<JsonRpcCachedProvider>,
     block_tx: mpsc::Sender<U64>,
