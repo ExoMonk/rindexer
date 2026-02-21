@@ -86,9 +86,13 @@ pub async fn find_fork_point(
     provider: &Arc<JsonRpcCachedProvider>,
     reorged_block: u64,
 ) -> u64 {
-    // Collect block numbers we have cached, walking backwards from just before the reorg
+    // Collect cached block numbers walking backwards from just before the reorg.
+    // Cap scan at cache size to avoid iterating millions of empty slots.
     let mut blocks_to_check: Vec<U64> = Vec::new();
-    for block_num in (1..reorged_block).rev() {
+    let max_scan = block_cache.len() + 64; // allow gaps between cached blocks
+    let scan_start = reorged_block.saturating_sub(1);
+    let scan_end = scan_start.saturating_sub(max_scan as u64);
+    for block_num in (scan_end..=scan_start).rev() {
         if block_cache.peek(&block_num).is_some() {
             blocks_to_check.push(U64::from(block_num));
         }
@@ -268,12 +272,11 @@ pub async fn handle_native_transfer_reorg_recovery(
         delete_events_postgres(pg, &schema, event_table_name, fork_block, network).await;
         // Checkpoint uses "native_transfer" as event name (hardcoded in last_synced.rs)
         rewind_checkpoint_postgres(pg, &schema, "native_transfer", rewind_block, network).await;
+        info!(
+            "Native transfer reorg recovery complete: checkpoint rewound to block {} for {}.{}",
+            rewind_block, schema, event_table_name
+        );
     }
-
-    info!(
-        "Native transfer reorg recovery complete: checkpoint rewound to block {} for {}.{}",
-        rewind_block, schema, event_table_name
-    );
 }
 
 #[cfg(test)]

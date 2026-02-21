@@ -228,6 +228,8 @@ pub async fn native_transfer_block_fetch(
 
                     // Rewind to re-publish blocks from fork point
                     last_seen_block = U64::from(fork_block.saturating_sub(1));
+                    // Drain any pending reth signals to avoid double recovery
+                    while reth_reorg_rx.try_recv().is_ok() {}
                     continue;
                 }
 

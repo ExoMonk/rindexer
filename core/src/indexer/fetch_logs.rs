@@ -555,6 +555,8 @@ async fn live_indexing_stream(
                         // Rewind cursor to fork point
                         current_filter = current_filter.set_from_block(U64::from(fork_block));
                         last_seen_block_number = U64::from(fork_block.saturating_sub(1));
+                        // Drain any pending reth signals to avoid double recovery
+                        while reth_reorg_rx.try_recv().is_ok() {}
                         continue;
                     }
 
@@ -715,6 +717,8 @@ async fn live_indexing_stream(
                                                 .set_from_block(U64::from(min_removed_block));
                                             last_seen_block_number =
                                                 U64::from(min_removed_block.saturating_sub(1));
+                                            // Drain any pending reth signals to avoid double recovery
+                                            while reth_reorg_rx.try_recv().is_ok() {}
                                             continue;
                                         }
 
