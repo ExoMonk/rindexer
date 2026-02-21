@@ -15,7 +15,7 @@ use tracing::{debug, error, info, warn};
 
 use tokio_util::sync::CancellationToken;
 
-use crate::indexer::fetch_logs::BlockMeta;
+use crate::indexer::fetch_logs::{BlockMeta, ReorgInfo};
 use crate::indexer::reorg::{find_fork_point, handle_native_transfer_reorg_recovery};
 use crate::is_running;
 use crate::metrics::indexing as metrics;
@@ -129,16 +129,19 @@ pub async fn native_transfer_block_fetch(
     // Block metadata cache for reorg detection via parent hash chain validation.
     let mut block_cache: LruCache<u64, BlockMeta> = LruCache::new(NonZeroUsize::new(1024).unwrap());
 
-    let chain_state_notification = publisher.get_chain_state_notification();
+    // Channel for reth-provided reorg signals (None for HTTP RPC users).
+    let (reth_reorg_tx, mut reth_reorg_rx) = tokio::sync::mpsc::unbounded_channel::<ReorgInfo>();
 
-    // Spawn a separate task to handle notifications
-    if let Some(notifications) = chain_state_notification {
-        // Subscribe to notifications for this network
-        let mut notifications_clone = notifications.subscribe();
+    if let Some(notifications) = publisher.get_chain_state_notification() {
         let network_clone = network.clone();
         tokio::spawn(async move {
-            while let Ok(notification) = notifications_clone.recv().await {
-                handle_chain_notification(notification, "NativeTransfer", &network_clone);
+            let mut rx = notifications.subscribe();
+            while let Ok(notification) = rx.recv().await {
+                if let Some(reorg_info) =
+                    handle_chain_notification(notification, "NativeTransfer", &network_clone)
+                {
+                    let _ = reth_reorg_tx.send(reorg_info);
+                }
             }
         });
     }
@@ -147,6 +150,25 @@ pub async fn native_transfer_block_fetch(
         if !is_running() || cancel_token.is_cancelled() {
             info!("Exiting native transfer indexing block processor!");
             break Ok(());
+        }
+
+        // Reth reorg signal — instant detection, same recovery as cache-based.
+        if let Ok(reth_reorg) = reth_reorg_rx.try_recv() {
+            let fork_block = reth_reorg.fork_block.to::<u64>();
+            warn!(
+                "NativeTransfer on {} - REORG (reth notification): depth={}, fork_block={}",
+                network, reth_reorg.depth, fork_block
+            );
+
+            for b in fork_block..=(fork_block + reth_reorg.depth) {
+                block_cache.pop(&b);
+            }
+
+            handle_native_transfer_reorg_recovery(&postgres, &indexer_name, &network, fork_block)
+                .await;
+
+            last_seen_block = U64::from(fork_block.saturating_sub(1));
+            continue;
         }
 
         let latest_block = publisher.get_latest_block().await;

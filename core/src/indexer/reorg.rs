@@ -18,11 +18,13 @@ use crate::PostgresClient;
 
 /// Handles chain state notifications (reorgs, reverts, commits).
 /// Used by reth feature-gated providers that emit chain state events.
+/// Returns `Some(ReorgInfo)` when a reorg/revert is detected, so the caller
+/// can forward it to the main indexing loop for recovery.
 pub fn handle_chain_notification(
     notification: ChainStateNotification,
     info_log_name: &str,
     network: &str,
-) {
+) -> Option<ReorgInfo> {
     match notification {
         ChainStateNotification::Reorged {
             revert_from_block,
@@ -35,27 +37,34 @@ pub fn handle_chain_notification(
             metrics::record_reorg(network, depth);
 
             warn!(
-                "{} - REORG DETECTED! Need to revert blocks {} to {} and re-index {} to {} (new tip: {})",
+                "{} - REORG (reth): revert blocks {} to {}, re-index {} to {} (new tip: {})",
                 info_log_name,
-                revert_from_block, revert_to_block,
-                new_from_block, new_to_block,
+                revert_from_block,
+                revert_to_block,
+                new_from_block,
+                new_to_block,
                 new_tip_hash
             );
+
+            Some(ReorgInfo { fork_block: U64::from(revert_to_block), depth })
         }
         ChainStateNotification::Reverted { from_block, to_block } => {
             let depth = from_block.saturating_sub(to_block);
             metrics::record_reorg(network, depth);
 
             warn!(
-                "{} - CHAIN REVERTED! Blocks {} to {} have been reverted",
+                "{} - CHAIN REVERTED (reth): blocks {} to {} have been reverted",
                 info_log_name, from_block, to_block
             );
+
+            Some(ReorgInfo { fork_block: U64::from(to_block), depth })
         }
         ChainStateNotification::Committed { from_block, to_block, tip_hash } => {
             debug!(
                 "{} - Chain committed: blocks {} to {} (tip: {})",
                 info_log_name, from_block, to_block, tip_hash
             );
+            None
         }
     }
 }

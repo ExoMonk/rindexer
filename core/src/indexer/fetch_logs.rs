@@ -427,16 +427,22 @@ async fn live_indexing_stream(
     let log_no_new_block_interval = Duration::from_secs(300);
     let target_iteration_duration = Duration::from_millis(200);
 
-    let chain_state_notification = cached_provider.get_chain_state_notification();
+    // Channel for reth-provided reorg signals (feature-gated, None for HTTP RPC).
+    // The spawned task converts ChainStateNotification → ReorgInfo and sends here;
+    // the main loop try_recv()s to trigger the same recovery codepath as cache-based detection.
+    let (reth_reorg_tx, mut reth_reorg_rx) = tokio::sync::mpsc::unbounded_channel::<ReorgInfo>();
 
-    // Spawn a separate task to handle notifications
-    if let Some(notifications) = chain_state_notification {
+    if let Some(notifications) = cached_provider.get_chain_state_notification() {
         let info_log_name = info_log_name.to_string();
         let network = network.to_string();
         tokio::spawn(async move {
-            let mut notifications_clone = notifications.subscribe();
-            while let Ok(notification) = notifications_clone.recv().await {
-                handle_chain_notification(notification, &info_log_name, &network);
+            let mut rx = notifications.subscribe();
+            while let Ok(notification) = rx.recv().await {
+                if let Some(reorg_info) =
+                    handle_chain_notification(notification, &info_log_name, &network)
+                {
+                    let _ = reth_reorg_tx.send(reorg_info);
+                }
             }
         });
     }
@@ -452,6 +458,33 @@ async fn live_indexing_stream(
 
         if !is_running() || cancel_token.is_cancelled() {
             break;
+        }
+
+        // Reth reorg signal — instant detection, skip cache-based checks.
+        // Enters the same FetchLogsResult → handle_reorg_recovery pipeline.
+        if let Ok(reth_reorg) = reth_reorg_rx.try_recv() {
+            let fork_block = reth_reorg.fork_block.to::<u64>();
+            warn!(
+                "{} - REORG (reth notification): depth={}, fork_block={}",
+                info_log_name, reth_reorg.depth, fork_block
+            );
+
+            for b in fork_block..=(fork_block + reth_reorg.depth) {
+                block_cache.pop(&b);
+            }
+
+            let _ = tx
+                .send(Ok(FetchLogsResult {
+                    logs: vec![],
+                    from_block: U64::from(fork_block),
+                    to_block: U64::from(fork_block),
+                    reorg: Some(reth_reorg),
+                }))
+                .await;
+
+            current_filter = current_filter.set_from_block(U64::from(fork_block));
+            last_seen_block_number = U64::from(fork_block.saturating_sub(1));
+            continue;
         }
 
         let latest_block = cached_provider.get_latest_block().await;
