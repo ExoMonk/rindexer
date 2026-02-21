@@ -447,8 +447,7 @@ async fn live_indexing_stream(
     // Used for: (1) cheap timestamp lookups for logs, (2) reorg detection via parent hash
     // chain validation. 1024 entries covers ~34 min of Polygon blocks (one Heimdall
     // checkpoint period) at ~100KB memory cost.
-    let mut block_cache: LruCache<u64, BlockMeta> =
-        LruCache::new(NonZeroUsize::new(1024).unwrap());
+    let mut block_cache: LruCache<u64, BlockMeta> = LruCache::new(NonZeroUsize::new(1024).unwrap());
 
     loop {
         let iteration_start = Instant::now();
@@ -482,38 +481,29 @@ async fn live_indexing_stream(
                     // Reorg detection #2: parent hash chain discontinuity.
                     // The next block's parent_hash doesn't match our cached hash for
                     // the previous block — the chain forked between them.
-                    let parent_mismatch =
-                        if !tip_reorged && latest_block.header.number > 0 {
-                            block_cache
-                                .peek(&(latest_block.header.number - 1))
-                                .map(|cached| {
-                                    cached.hash != latest_block.header.parent_hash
-                                })
-                                .unwrap_or(false)
-                        } else {
-                            false
-                        };
+                    let parent_mismatch = if !tip_reorged && latest_block.header.number > 0 {
+                        block_cache
+                            .peek(&(latest_block.header.number - 1))
+                            .map(|cached| cached.hash != latest_block.header.parent_hash)
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    };
 
                     if tip_reorged || parent_mismatch {
-                        let reason = if tip_reorged {
-                            "tip hash changed"
-                        } else {
-                            "parent hash mismatch"
-                        };
-                        let fork_block =
-                            crate::indexer::reorg::find_fork_point(
-                                &block_cache,
-                                cached_provider,
-                                latest_block.header.number,
-                            )
-                            .await;
-                        let depth =
-                            latest_block.header.number.saturating_sub(fork_block);
+                        let reason =
+                            if tip_reorged { "tip hash changed" } else { "parent hash mismatch" };
+                        let fork_block = crate::indexer::reorg::find_fork_point(
+                            &block_cache,
+                            cached_provider,
+                            latest_block.header.number,
+                        )
+                        .await;
+                        let depth = latest_block.header.number.saturating_sub(fork_block);
                         metrics::record_reorg(network, depth);
                         warn!(
                             "{} - REORG ({}): depth={}, fork_block={}, current_block={}",
-                            info_log_name, reason, depth, fork_block,
-                            latest_block.header.number
+                            info_log_name, reason, depth, fork_block, latest_block.header.number
                         );
 
                         // Invalidate cached hashes for reorged blocks
@@ -527,18 +517,13 @@ async fn live_indexing_stream(
                                 logs: vec![],
                                 from_block: U64::from(fork_block),
                                 to_block: U64::from(fork_block),
-                                reorg: Some(ReorgInfo {
-                                    fork_block: U64::from(fork_block),
-                                    depth,
-                                }),
+                                reorg: Some(ReorgInfo { fork_block: U64::from(fork_block), depth }),
                             }))
                             .await;
 
                         // Rewind cursor to fork point
-                        current_filter =
-                            current_filter.set_from_block(U64::from(fork_block));
-                        last_seen_block_number =
-                            U64::from(fork_block.saturating_sub(1));
+                        current_filter = current_filter.set_from_block(U64::from(fork_block));
+                        last_seen_block_number = U64::from(fork_block.saturating_sub(1));
                         continue;
                     }
 

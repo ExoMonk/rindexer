@@ -150,8 +150,7 @@ pub async fn handle_reorg_recovery(config: &Arc<EventProcessingConfig>, reorg: &
 
     if let Some(clickhouse) = &config.clickhouse() {
         delete_events_clickhouse(clickhouse, &schema, &event_table_name, fork_block).await;
-        rewind_checkpoint_clickhouse(clickhouse, &schema, &event_name, rewind_block, network)
-            .await;
+        rewind_checkpoint_clickhouse(clickhouse, &schema, &event_name, rewind_block, network).await;
     }
 
     info!(
@@ -186,8 +185,7 @@ async fn delete_events_clickhouse(
     fork_block: u64,
 ) {
     let full_table = format!("{}.{}", schema, event_table);
-    let query =
-        format!("ALTER TABLE {} DELETE WHERE block_number >= {}", full_table, fork_block);
+    let query = format!("ALTER TABLE {} DELETE WHERE block_number >= {}", full_table, fork_block);
 
     match clickhouse.execute(&query).await {
         Ok(_) => {

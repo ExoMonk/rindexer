@@ -19,8 +19,8 @@ use crate::indexer::fetch_logs::BlockMeta;
 use crate::indexer::reorg::{find_fork_point, handle_native_transfer_reorg_recovery};
 use crate::is_running;
 use crate::metrics::indexing as metrics;
-use crate::PostgresClient;
 use crate::provider::RECOMMENDED_RPC_CHUNK_SIZE;
+use crate::PostgresClient;
 use crate::{
     event::{
         callback_registry::{TraceResult, TxInformation},
@@ -126,8 +126,7 @@ pub async fn native_transfer_block_fetch(
     let mut last_seen_block = start_block;
 
     // Block metadata cache for reorg detection via parent hash chain validation.
-    let mut block_cache: LruCache<u64, BlockMeta> =
-        LruCache::new(NonZeroUsize::new(1024).unwrap());
+    let mut block_cache: LruCache<u64, BlockMeta> = LruCache::new(NonZeroUsize::new(1024).unwrap());
 
     let chain_state_notification = publisher.get_chain_state_notification();
 
@@ -179,13 +178,10 @@ pub async fn native_transfer_block_fetch(
                 };
 
                 if tip_reorged || parent_mismatch {
-                    let reason = if tip_reorged { "tip hash changed" } else { "parent hash mismatch" };
-                    let fork_block = find_fork_point(
-                        &block_cache,
-                        &publisher,
-                        latest_block.header.number,
-                    )
-                    .await;
+                    let reason =
+                        if tip_reorged { "tip hash changed" } else { "parent hash mismatch" };
+                    let fork_block =
+                        find_fork_point(&block_cache, &publisher, latest_block.header.number).await;
                     let depth = latest_block.header.number.saturating_sub(fork_block);
                     metrics::record_reorg(&network, depth);
                     warn!(

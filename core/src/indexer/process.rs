@@ -14,7 +14,9 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 use crate::helpers::is_relevant_block;
-use crate::indexer::reorg::{find_fork_point, handle_reorg_recovery, reorg_safe_distance_for_chain};
+use crate::indexer::reorg::{
+    find_fork_point, handle_reorg_recovery, reorg_safe_distance_for_chain,
+};
 use crate::metrics::indexing as metrics;
 use crate::provider::JsonRpcCachedProvider;
 use crate::{
@@ -333,8 +335,7 @@ async fn live_indexing_for_contract_event_dependencies(
     let generation_cancel = events.first().map(|(config, _)| config.cancel_token().clone());
 
     // Block metadata cache for reorg detection via parent hash chain validation.
-    let mut block_cache: LruCache<u64, BlockMeta> =
-        LruCache::new(NonZeroUsize::new(1024).unwrap());
+    let mut block_cache: LruCache<u64, BlockMeta> = LruCache::new(NonZeroUsize::new(1024).unwrap());
 
     loop {
         if !is_running() {
@@ -583,8 +584,7 @@ async fn live_indexing_for_contract_event_dependencies(
                             .filter_map(|l| l.block_number)
                             .min()
                             .unwrap_or(from_block.to::<u64>());
-                        let depth =
-                            from_block.to::<u64>().saturating_sub(min_removed_block);
+                        let depth = from_block.to::<u64>().saturating_sub(min_removed_block);
                         metrics::record_reorg(&network, depth);
                         warn!(
                             "{} - REORG (removed logs): fork_block={}, depth={}",
@@ -593,10 +593,8 @@ async fn live_indexing_for_contract_event_dependencies(
                             depth
                         );
 
-                        let reorg_info = ReorgInfo {
-                            fork_block: U64::from(min_removed_block),
-                            depth,
-                        };
+                        let reorg_info =
+                            ReorgInfo { fork_block: U64::from(min_removed_block), depth };
                         handle_reorg_recovery(config, &reorg_info).await;
 
                         // Rewind cursor for this event
