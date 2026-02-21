@@ -198,7 +198,12 @@ async fn delete_events_clickhouse(
     fork_block: u64,
 ) {
     let full_table = format!("{}.{}", schema, event_table);
-    let query = format!("ALTER TABLE {} DELETE WHERE block_number >= {}", full_table, fork_block);
+    // mutations_sync = 1 makes the DELETE synchronous — waits for completion before returning.
+    // Without this, rindexer can re-index and insert new events before the old ones are deleted.
+    let query = format!(
+        "ALTER TABLE {} DELETE WHERE block_number >= {} SETTINGS mutations_sync = 1",
+        full_table, fork_block
+    );
 
     match clickhouse.execute(&query).await {
         Ok(_) => {
