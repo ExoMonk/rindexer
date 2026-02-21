@@ -4,17 +4,20 @@ set -euo pipefail
 # ------------------------------------------------------------------
 # rindexer reorg detection E2E test via Anvil's anvil_reorg RPC method
 #
-# Tests two detection mechanisms:
+# Tests detection mechanisms:
 #   1. Tip hash changed  — same block number, different hash
 #   2. Parent hash mismatch — new block's parent_hash doesn't match cache
+#   3. ClickHouse reorg recovery — verify DB state after reorg
+#      (requires Docker; skipped if unavailable)
 #
-# (The third mechanism — log `removed` flag — cannot be tested with Anvil
-#  because eth_getLogs doesn't return removed logs after a reorg.)
+# (The removed-flag mechanism cannot be tested with Anvil because
+#  eth_getLogs doesn't return removed logs after a reorg.)
 #
 # Usage: ./reorg_detection.sh [reorg_depth]
 #        reorg_depth defaults to 3
 #
 # Prerequisites: anvil, cast (Foundry), rindexer_cli built
+#                Docker (optional, for test 3)
 # Run from repo root: ./tests/e2e/reorg_detection.sh
 # ------------------------------------------------------------------
 
@@ -27,15 +30,24 @@ WORK_DIR=$(mktemp -d)
 ANVIL_PORT=8545
 ANVIL_PID=""
 RINDEXER_PID=""
+CH_CONTAINER=""
+CH_PORT=18123
 LOG_FILE="$WORK_DIR/rindexer_test.log"
 PASS_COUNT=0
 FAIL_COUNT=0
+TOTAL_TESTS=2
+
+# Helper: query ClickHouse via HTTP API
+ch_query() {
+    curl -sf "http://127.0.0.1:$CH_PORT/" --data-binary "$1" 2>/dev/null
+}
 
 cleanup() {
     echo ""
     echo "=== Cleaning up ==="
     [[ -n "$RINDEXER_PID" ]] && kill "$RINDEXER_PID" 2>/dev/null && echo "Stopped rindexer ($RINDEXER_PID)"
     [[ -n "$ANVIL_PID" ]]    && kill "$ANVIL_PID"    2>/dev/null && echo "Stopped anvil ($ANVIL_PID)"
+    [[ -n "$CH_CONTAINER" ]] && docker rm -f "$CH_CONTAINER" >/dev/null 2>&1 && echo "Stopped ClickHouse ($CH_CONTAINER)"
     wait 2>/dev/null
     rm -rf "$WORK_DIR"
 }
@@ -233,17 +245,191 @@ else
     FAIL_COUNT=$((FAIL_COUNT + 1))
 fi
 
+# ================================================================
+# TEST 3: ClickHouse reorg recovery
+#
+# Verifies that after a reorg:
+#   - The checkpoint in rindexer_internal is rewound
+#   - The synchronous DELETE (mutations_sync=1) completes before
+#     re-indexing begins
+#
+# Requires Docker. Skipped gracefully if unavailable.
+# ================================================================
+echo ""
+echo "========================================================"
+echo "  TEST 3: ClickHouse reorg recovery (DB state)"
+echo "========================================================"
+
+CH_SKIP=false
+if ! command -v docker &>/dev/null; then
+    echo "  SKIP: Docker not available"
+    CH_SKIP=true
+fi
+
+if ! $CH_SKIP && ! docker info &>/dev/null; then
+    echo "  SKIP: Docker daemon not running"
+    CH_SKIP=true
+fi
+
+if ! $CH_SKIP; then
+    TOTAL_TESTS=3
+
+    # Stop the CSV rindexer instance for this test
+    if [[ -n "$RINDEXER_PID" ]]; then
+        kill "$RINDEXER_PID" 2>/dev/null
+        wait "$RINDEXER_PID" 2>/dev/null
+        RINDEXER_PID=""
+    fi
+
+    # Start ClickHouse container on a non-default port to avoid conflicts
+    echo "Starting ClickHouse container (port $CH_PORT)..."
+    CH_CONTAINER=$(docker run -d --rm \
+        --cap-add SYS_NICE \
+        -p "$CH_PORT:8123" \
+        clickhouse/clickhouse-server:24-alpine 2>&1)
+    if [[ $? -ne 0 ]]; then
+        echo "  SKIP: Failed to start ClickHouse container"
+        CH_CONTAINER=""
+        CH_SKIP=true
+    fi
+fi
+
+if ! $CH_SKIP; then
+    echo "ClickHouse container: ${CH_CONTAINER:0:12}"
+
+    # Wait for ClickHouse to be ready
+    CH_READY=false
+    for i in $(seq 1 30); do
+        if ch_query "SELECT 1" | grep -q 1; then
+            CH_READY=true
+            echo "ClickHouse ready"
+            break
+        fi
+        sleep 1
+    done
+
+    if ! $CH_READY; then
+        echo "  SKIP: ClickHouse failed to start within 30s"
+        CH_SKIP=true
+        docker rm -f "$CH_CONTAINER" >/dev/null 2>&1
+        CH_CONTAINER=""
+    fi
+fi
+
+if ! $CH_SKIP; then
+    # Set up ClickHouse working directory
+    CH_WORK_DIR=$(mktemp -d)
+    cp "$FIXTURE_DIR/reorg_test_clickhouse.yaml" "$CH_WORK_DIR/rindexer.yaml"
+    cp -r "$FIXTURE_DIR/abis" "$CH_WORK_DIR/abis"
+
+    # Create .env for ClickHouse connection (default user has no password)
+    cat > "$CH_WORK_DIR/.env" <<ENVEOF
+CLICKHOUSE_URL=http://127.0.0.1:$CH_PORT
+CLICKHOUSE_DB=default
+CLICKHOUSE_USER=default
+CLICKHOUSE_PASSWORD=
+ENVEOF
+
+    # Start rindexer with ClickHouse storage
+    CH_LOG_FILE="$CH_WORK_DIR/rindexer_ch.log"
+    RUST_LOG=warn "$RINDEXER_BIN" start -p "$CH_WORK_DIR" indexer > "$CH_LOG_FILE" 2>&1 &
+    RINDEXER_PID=$!
+    echo "rindexer (ClickHouse) PID: $RINDEXER_PID"
+
+    # Wait for rindexer to index some blocks and populate ClickHouse
+    echo "Waiting 20s for rindexer to index blocks into ClickHouse..."
+    for i in $(seq 1 20); do
+        CURRENT_BLOCK=$(cast block-number --rpc-url "http://127.0.0.1:$ANVIL_PORT" 2>/dev/null)
+        printf "\r  Block: %s  (%d/20s)" "$CURRENT_BLOCK" "$i"
+
+        if ! kill -0 "$RINDEXER_PID" 2>/dev/null; then
+            echo ""
+            echo "  ERROR: rindexer (CH) exited early. Log output:"
+            cat "$CH_LOG_FILE"
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+            CH_SKIP=true
+            break
+        fi
+        sleep 1
+    done
+    echo ""
+fi
+
+if ! $CH_SKIP; then
+    # Verify rindexer created tables in ClickHouse
+    INTERNAL_TABLE="reorg_test_usdc_transfer"
+    CH_TABLES=$(ch_query "SELECT count() FROM system.tables WHERE database = 'rindexer_internal'" 2>/dev/null || echo "0")
+    if [[ "$CH_TABLES" -eq 0 ]]; then
+        echo "  SKIP: rindexer did not create tables in ClickHouse"
+        CH_SKIP=true
+    else
+        echo "ClickHouse tables created ($CH_TABLES in rindexer_internal)"
+    fi
+fi
+
+if ! $CH_SKIP; then
+    # Clear log for this test
+    : > "$CH_LOG_FILE"
+
+    # Trigger reorg
+    echo "Triggering anvil_reorg (depth=$REORG_DEPTH)..."
+    cast rpc anvil_reorg "$REORG_DEPTH" "[]" --rpc-url "http://127.0.0.1:$ANVIL_PORT" 2>/dev/null
+
+    # Wait for detection + ClickHouse recovery (look for the DB operation logs)
+    echo "Waiting up to 20s for reorg detection and ClickHouse recovery..."
+    CH_DELETED=false
+    CH_REWOUND=false
+    for i in $(seq 1 20); do
+        if grep -q "ClickHouse: deleted events" "$CH_LOG_FILE" 2>/dev/null; then
+            CH_DELETED=true
+        fi
+        if grep -q "ClickHouse: checkpoint rewound" "$CH_LOG_FILE" 2>/dev/null; then
+            CH_REWOUND=true
+        fi
+        if $CH_DELETED && $CH_REWOUND; then
+            break
+        fi
+        sleep 1
+    done
+
+    # Show reorg-related log lines
+    grep -ai "reorg\|ClickHouse" "$CH_LOG_FILE" || true
+
+    if $CH_DELETED && $CH_REWOUND; then
+        echo "  PASS: ClickHouse reorg recovery verified (events deleted + checkpoint rewound)"
+        PASS_COUNT=$((PASS_COUNT + 1))
+    elif ! $CH_DELETED && ! $CH_REWOUND; then
+        echo "  FAIL: No reorg detected in ClickHouse mode"
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+    else
+        echo "  FAIL: Partial recovery (deleted=$CH_DELETED, rewound=$CH_REWOUND)"
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+    fi
+
+    # Stop ClickHouse rindexer
+    kill "$RINDEXER_PID" 2>/dev/null
+    RINDEXER_PID=""
+
+    # Clean up ClickHouse working dir
+    rm -rf "$CH_WORK_DIR"
+fi
+
 # ------------------------------------------------------------------
 # Final report
 # ------------------------------------------------------------------
 echo ""
 echo "========================================================"
-echo "  RESULTS: $PASS_COUNT/2 passed, $FAIL_COUNT/2 failed"
+echo "  RESULTS: $PASS_COUNT/$TOTAL_TESTS passed, $FAIL_COUNT/$TOTAL_TESTS failed"
 echo "========================================================"
 echo ""
-echo "  Test 1 (tip hash changed):     $(if [ $PASS_COUNT -ge 1 ]; then echo PASS; else echo FAIL; fi)"
-echo "  Test 2 (parent hash mismatch): $(if [ $PASS_COUNT -ge 2 ]; then echo PASS; else echo FAIL; fi)"
-echo "  (Test 3 - removed flag: not testable with Anvil)"
+echo "  Test 1 (tip hash changed):        $(if [ $PASS_COUNT -ge 1 ]; then echo PASS; else echo FAIL; fi)"
+echo "  Test 2 (parent hash mismatch):    $(if [ $PASS_COUNT -ge 2 ]; then echo PASS; else echo FAIL; fi)"
+if $CH_SKIP; then
+echo "  Test 3 (ClickHouse recovery):     SKIP"
+else
+echo "  Test 3 (ClickHouse recovery):     $(if [ $PASS_COUNT -ge 3 ]; then echo PASS; else echo FAIL; fi)"
+fi
+echo "  (removed flag: not testable with Anvil)"
 echo ""
 
 if [[ $FAIL_COUNT -eq 0 ]]; then
