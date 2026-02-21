@@ -241,6 +241,34 @@ async fn rewind_checkpoint_clickhouse(
     }
 }
 
+/// Handles reorg recovery for native transfer indexing (PostgreSQL only, no ClickHouse for traces).
+pub async fn handle_native_transfer_reorg_recovery(
+    postgres: &Option<Arc<PostgresClient>>,
+    indexer_name: &str,
+    network: &str,
+    fork_block: u64,
+) {
+    let schema = generate_indexer_contract_schema_name(indexer_name, "EvmTraces");
+    let event_table_name = "native_transfer";
+    let rewind_block = fork_block.saturating_sub(1);
+
+    info!(
+        "Native transfer reorg recovery: deleting from block >= {} for {}.{} on {}",
+        fork_block, schema, event_table_name, network
+    );
+
+    if let Some(pg) = postgres {
+        delete_events_postgres(pg, &schema, event_table_name, fork_block, network).await;
+        // Checkpoint uses "native_transfer" as event name (hardcoded in last_synced.rs)
+        rewind_checkpoint_postgres(pg, &schema, "native_transfer", rewind_block, network).await;
+    }
+
+    info!(
+        "Native transfer reorg recovery complete: checkpoint rewound to block {} for {}.{}",
+        rewind_block, schema, event_table_name
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

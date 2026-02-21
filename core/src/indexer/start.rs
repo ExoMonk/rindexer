@@ -270,6 +270,8 @@ async fn start_indexing_traces(
             indexing_distance_from_head,
             network_name.clone(),
             cancel_token.clone(),
+            postgres.clone(),
+            first_event.indexer_name.clone(),
         ));
 
         non_blocking_process_events.push(block_fetch_handle);

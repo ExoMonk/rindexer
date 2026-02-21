@@ -445,9 +445,10 @@ async fn live_indexing_stream(
 
     // Local cache of recent block metadata (hash, parent_hash, timestamp).
     // Used for: (1) cheap timestamp lookups for logs, (2) reorg detection via parent hash
-    // chain validation. 256 entries covers ~8 min of Polygon blocks at near-zero memory cost.
+    // chain validation. 1024 entries covers ~34 min of Polygon blocks (one Heimdall
+    // checkpoint period) at ~100KB memory cost.
     let mut block_cache: LruCache<u64, BlockMeta> =
-        LruCache::new(NonZeroUsize::new(256).unwrap());
+        LruCache::new(NonZeroUsize::new(1024).unwrap());
 
     loop {
         let iteration_start = Instant::now();
@@ -460,6 +461,15 @@ async fn live_indexing_stream(
         match latest_block {
             Ok(latest_block) => {
                 if let Some(latest_block) = latest_block {
+                    // Reorg detection #1: tip hash changed (same block number, different hash).
+                    // Critical for fast chains like Polygon where we poll multiple times
+                    // per block and may see the same block number with a different hash
+                    // after a tip reorg — must check BEFORE overwriting the cache.
+                    let tip_reorged = block_cache
+                        .peek(&latest_block.header.number)
+                        .map(|cached| cached.hash != latest_block.header.hash)
+                        .unwrap_or(false);
+
                     block_cache.put(
                         latest_block.header.number,
                         BlockMeta {
@@ -469,53 +479,67 @@ async fn live_indexing_stream(
                         },
                     );
 
-                    // Reorg detection: validate parent hash continuity
-                    if latest_block.header.number > 0 {
-                        if let Some(cached) =
-                            block_cache.get(&(latest_block.header.number - 1))
-                        {
-                            if cached.hash != latest_block.header.parent_hash {
-                                let fork_block =
-                                    crate::indexer::reorg::find_fork_point(
-                                        &block_cache,
-                                        cached_provider,
-                                        latest_block.header.number,
-                                    )
-                                    .await;
-                                let depth =
-                                    latest_block.header.number.saturating_sub(fork_block);
-                                metrics::record_reorg(network, depth);
-                                warn!(
-                                    "{} - REORG DETECTED: depth={}, fork_block={}, current_block={}",
-                                    info_log_name, depth, fork_block, latest_block.header.number
-                                );
+                    // Reorg detection #2: parent hash chain discontinuity.
+                    // The next block's parent_hash doesn't match our cached hash for
+                    // the previous block — the chain forked between them.
+                    let parent_mismatch =
+                        if !tip_reorged && latest_block.header.number > 0 {
+                            block_cache
+                                .peek(&(latest_block.header.number - 1))
+                                .map(|cached| {
+                                    cached.hash != latest_block.header.parent_hash
+                                })
+                                .unwrap_or(false)
+                        } else {
+                            false
+                        };
 
-                                // Invalidate cached hashes for reorged blocks
-                                for b in fork_block..=latest_block.header.number {
-                                    block_cache.pop(&b);
-                                }
+                    if tip_reorged || parent_mismatch {
+                        let reason = if tip_reorged {
+                            "tip hash changed"
+                        } else {
+                            "parent hash mismatch"
+                        };
+                        let fork_block =
+                            crate::indexer::reorg::find_fork_point(
+                                &block_cache,
+                                cached_provider,
+                                latest_block.header.number,
+                            )
+                            .await;
+                        let depth =
+                            latest_block.header.number.saturating_sub(fork_block);
+                        metrics::record_reorg(network, depth);
+                        warn!(
+                            "{} - REORG ({}): depth={}, fork_block={}, current_block={}",
+                            info_log_name, reason, depth, fork_block,
+                            latest_block.header.number
+                        );
 
-                                // Send reorg signal to consumer
-                                let _ = tx
-                                    .send(Ok(FetchLogsResult {
-                                        logs: vec![],
-                                        from_block: U64::from(fork_block),
-                                        to_block: U64::from(fork_block),
-                                        reorg: Some(ReorgInfo {
-                                            fork_block: U64::from(fork_block),
-                                            depth,
-                                        }),
-                                    }))
-                                    .await;
-
-                                // Rewind cursor to fork point
-                                current_filter =
-                                    current_filter.set_from_block(U64::from(fork_block));
-                                last_seen_block_number =
-                                    U64::from(fork_block.saturating_sub(1));
-                                continue;
-                            }
+                        // Invalidate cached hashes for reorged blocks
+                        for b in fork_block..=latest_block.header.number {
+                            block_cache.pop(&b);
                         }
+
+                        // Send reorg signal to consumer
+                        let _ = tx
+                            .send(Ok(FetchLogsResult {
+                                logs: vec![],
+                                from_block: U64::from(fork_block),
+                                to_block: U64::from(fork_block),
+                                reorg: Some(ReorgInfo {
+                                    fork_block: U64::from(fork_block),
+                                    depth,
+                                }),
+                            }))
+                            .await;
+
+                        // Rewind cursor to fork point
+                        current_filter =
+                            current_filter.set_from_block(U64::from(fork_block));
+                        last_seen_block_number =
+                            U64::from(fork_block.saturating_sub(1));
+                        continue;
                     }
 
                     let latest_block_number = log_response_to_large_to_block

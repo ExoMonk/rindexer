@@ -16,9 +16,10 @@ use tracing::{debug, error, info, warn};
 use tokio_util::sync::CancellationToken;
 
 use crate::indexer::fetch_logs::BlockMeta;
-use crate::indexer::reorg::find_fork_point;
+use crate::indexer::reorg::{find_fork_point, handle_native_transfer_reorg_recovery};
 use crate::is_running;
 use crate::metrics::indexing as metrics;
+use crate::PostgresClient;
 use crate::provider::RECOMMENDED_RPC_CHUNK_SIZE;
 use crate::{
     event::{
@@ -119,12 +120,14 @@ pub async fn native_transfer_block_fetch(
     indexing_distance_from_head: U64,
     network: String,
     cancel_token: CancellationToken,
+    postgres: Option<Arc<PostgresClient>>,
+    indexer_name: String,
 ) -> Result<(), ProcessEventError> {
     let mut last_seen_block = start_block;
 
     // Block metadata cache for reorg detection via parent hash chain validation.
     let mut block_cache: LruCache<u64, BlockMeta> =
-        LruCache::new(NonZeroUsize::new(256).unwrap());
+        LruCache::new(NonZeroUsize::new(1024).unwrap());
 
     let chain_state_notification = publisher.get_chain_state_notification();
 
@@ -150,7 +153,12 @@ pub async fn native_transfer_block_fetch(
 
         match latest_block {
             Ok(Some(latest_block)) => {
-                // Store block metadata for reorg detection
+                // Reorg detection #1: tip hash changed (same block, different hash)
+                let tip_reorged = block_cache
+                    .peek(&latest_block.header.number)
+                    .map(|cached| cached.hash != latest_block.header.hash)
+                    .unwrap_or(false);
+
                 block_cache.put(
                     latest_block.header.number,
                     BlockMeta {
@@ -160,8 +168,8 @@ pub async fn native_transfer_block_fetch(
                     },
                 );
 
-                // Parent hash chain validation: detect reorgs
-                let parent_mismatch = if latest_block.header.number > 0 {
+                // Reorg detection #2: parent hash chain discontinuity
+                let parent_mismatch = if !tip_reorged && latest_block.header.number > 0 {
                     block_cache
                         .peek(&(latest_block.header.number - 1))
                         .map(|cached| cached.hash != latest_block.header.parent_hash)
@@ -170,7 +178,8 @@ pub async fn native_transfer_block_fetch(
                     false
                 };
 
-                if parent_mismatch {
+                if tip_reorged || parent_mismatch {
+                    let reason = if tip_reorged { "tip hash changed" } else { "parent hash mismatch" };
                     let fork_block = find_fork_point(
                         &block_cache,
                         &publisher,
@@ -180,14 +189,23 @@ pub async fn native_transfer_block_fetch(
                     let depth = latest_block.header.number.saturating_sub(fork_block);
                     metrics::record_reorg(&network, depth);
                     warn!(
-                        "NativeTransfer on {} - REORG DETECTED: depth={}, fork_block={}",
-                        network, depth, fork_block
+                        "NativeTransfer on {} - REORG ({}): depth={}, fork_block={}",
+                        network, reason, depth, fork_block
                     );
 
                     // Invalidate cached hashes for reorged blocks
                     for b in fork_block..=latest_block.header.number {
                         block_cache.pop(&b);
                     }
+
+                    // Delete orphaned native transfer events and rewind checkpoint
+                    handle_native_transfer_reorg_recovery(
+                        &postgres,
+                        &indexer_name,
+                        &network,
+                        fork_block,
+                    )
+                    .await;
 
                     // Rewind to re-publish blocks from fork point
                     last_seen_block = U64::from(fork_block.saturating_sub(1));

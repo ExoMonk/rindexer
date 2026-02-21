@@ -334,7 +334,7 @@ async fn live_indexing_for_contract_event_dependencies(
 
     // Block metadata cache for reorg detection via parent hash chain validation.
     let mut block_cache: LruCache<u64, BlockMeta> =
-        LruCache::new(NonZeroUsize::new(256).unwrap());
+        LruCache::new(NonZeroUsize::new(1024).unwrap());
 
     loop {
         if !is_running() {
@@ -370,7 +370,12 @@ async fn live_indexing_for_contract_event_dependencies(
         };
         let latest_block_number = U64::from(latest_block.header.number);
 
-        // Reorg detection: store block metadata and validate parent hash chain
+        // Reorg detection #1: tip hash changed (same block, different hash)
+        let tip_reorged = block_cache
+            .peek(&latest_block.header.number)
+            .map(|cached| cached.hash != latest_block.header.hash)
+            .unwrap_or(false);
+
         block_cache.put(
             latest_block.header.number,
             BlockMeta {
@@ -380,7 +385,8 @@ async fn live_indexing_for_contract_event_dependencies(
             },
         );
 
-        let parent_mismatch = if latest_block.header.number > 0 {
+        // Reorg detection #2: parent hash chain discontinuity
+        let parent_mismatch = if !tip_reorged && latest_block.header.number > 0 {
             block_cache
                 .peek(&(latest_block.header.number - 1))
                 .map(|cached| cached.hash != latest_block.header.parent_hash)
@@ -389,14 +395,15 @@ async fn live_indexing_for_contract_event_dependencies(
             false
         };
 
-        if parent_mismatch {
+        if tip_reorged || parent_mismatch {
+            let reason = if tip_reorged { "tip hash changed" } else { "parent hash mismatch" };
             let fork_block =
                 find_fork_point(&block_cache, &cached_provider, latest_block.header.number).await;
             let depth = latest_block.header.number.saturating_sub(fork_block);
             metrics::record_reorg(&network, depth);
             warn!(
-                "Dependency indexer on {} - REORG DETECTED: depth={}, fork_block={}",
-                network, depth, fork_block
+                "Dependency indexer on {} - REORG ({}): depth={}, fork_block={}",
+                network, reason, depth, fork_block
             );
 
             // Invalidate cached hashes for reorged blocks
