@@ -35,6 +35,19 @@ pub static EVENTS_PROCESSED_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     .expect("failed to register EVENTS_PROCESSED_TOTAL")
 });
 
+/// Empty `eth_getLogs` answers for a live window whose tip block is bloom-positive for the stream.
+/// `outcome` is `retried` (the window was re-asked) or `gave_up` (the re-ask budget ran out and
+/// the empty answer was accepted; compare the block with another environment or the chain).
+/// Labels: network, outcome
+pub static LIVE_TIP_EMPTY_LOGS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "rindexer_live_tip_empty_logs_total",
+        "Empty eth_getLogs answers for a bloom-positive tip block, by outcome (retried, gave_up)",
+        &["network", "outcome"]
+    )
+    .expect("failed to register LIVE_TIP_EMPTY_LOGS_TOTAL")
+});
+
 /// Last synced block number per indexing target.
 /// Labels: network, contract, event
 pub static LAST_SYNCED_BLOCK: Lazy<GaugeVec> = Lazy::new(|| {
@@ -146,6 +159,18 @@ pub static DB_POOL_CONNECTIONS: Lazy<GaugeVec> = Lazy::new(|| {
         &["database", "state"]
     )
     .expect("failed to register DB_POOL_CONNECTIONS")
+});
+
+/// Atomic no-code batches: custom-table operations, their reorg journal rows, the raw
+/// event rows and the last-synced cursor committed in one Postgres transaction.
+/// Labels: status (committed/rolled_back), reason (ok/deadlock/cursor_missing/error)
+pub static ATOMIC_BATCHES_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "rindexer_atomic_batches_total",
+        "Atomic no-code batches (custom-table operations, journal, raw rows and cursor in one transaction) by outcome",
+        &["status", "reason"]
+    )
+    .expect("failed to register ATOMIC_BATCHES_TOTAL")
 });
 
 // =============================================================================
